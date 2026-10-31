@@ -15,6 +15,7 @@
 #include "../glx/lookup.h"
 #include "loader.h"
 #include "trace.h"
+#include "framediag.h"
 #include <EGL/eglext.h>
 #include <cstdio>
 #include <mutex>
@@ -402,16 +403,40 @@ namespace {
         return fn;
     }
 
+    // Opt-in frame-pacing diagnostics (see framediag.h). Reads the surface size so
+    // framediag.log can show it; only called when diagnostics are on.
+    void diagProbeSurfaceSize(EGLDisplay dpy, EGLSurface surface) {
+        LOAD_EGL(eglQuerySurface)
+        EGLint w = 0;
+        EGLint h = 0;
+        if (egl_eglQuerySurface(dpy, surface, EGL_WIDTH, &w) == EGL_TRUE &&
+            egl_eglQuerySurface(dpy, surface, EGL_HEIGHT, &h) == EGL_TRUE) {
+            mg_framediag::note_surface_size(w, h);
+        }
+    }
+
+    // Runs one backend swap between two clock reads when diagnostics are on. Off,
+    // it is the swap plus two cheap checks: it does not change what is presented
+    // or when. The size probe runs after the timed section, never inside it.
+    template <typename SwapFn>
+    EGLBoolean timedSwap(EGLDisplay dpy, EGLSurface surface, SwapFn&& swap) {
+        const bool probe_size = mg_framediag::swap_begin(dpy, surface);
+        const EGLBoolean result = swap();
+        mg_framediag::swap_end();
+        if (probe_size) diagProbeSurfaceSize(dpy, surface);
+        return result;
+    }
+
     // ApplyFSR upscales into the surface, the swap presents it, the resolution
     // check reacts to a surface that has changed size. The three belong together,
     // and every path that presents a frame has to go through here.
     EGLBoolean presentSurface(EGLDisplay dpy, EGLSurface surface) {
         LOAD_EGL(eglSwapBuffers)
         if (global_settings.fsr1_setting == FSR1_Quality_Preset::Disabled) {
-            return egl_eglSwapBuffers(dpy, surface);
+            return timedSwap(dpy, surface, [&] { return egl_eglSwapBuffers(dpy, surface); });
         }
         ApplyFSR();
-        const EGLBoolean result = egl_eglSwapBuffers(dpy, surface);
+        const EGLBoolean result = timedSwap(dpy, surface, [&] { return egl_eglSwapBuffers(dpy, surface); });
         CheckResolutionChange(dpy, surface);
         return result;
     }
@@ -427,7 +452,7 @@ namespace {
                                         SwapWithDamageFn backend) {
         const bool fsr_on = global_settings.fsr1_setting != FSR1_Quality_Preset::Disabled;
         if (backend != nullptr && !fsr_on) {
-            return backend(dpy, surface, rects, n_rects);
+            return timedSwap(dpy, surface, [&] { return backend(dpy, surface, rects, n_rects); });
         }
         // Once, not once a frame: a damage swap runs every frame the host presents
         // one, and this would otherwise be the loudest line in the whole trace for
@@ -612,7 +637,9 @@ extern "C"
                                               const EGLint* attrib_list) {
         LOG_D("eglCreateWindowSurface, dpy: %p, config: %p, win: %p, attrib_list: %p", dpy, config, win, attrib_list);
         LOAD_EGL(eglCreateWindowSurface)
-        return egl_eglCreateWindowSurface(dpy, config, win, attrib_list);
+        const EGLSurface surface = egl_eglCreateWindowSurface(dpy, config, win, attrib_list);
+        mg_framediag::event("eglCreateWindowSurface(window=%p) -> %p", (void*)win, surface);
+        return surface;
     }
 
     EGL_API EGLSurface eglCreatePbufferSurface(EGLDisplay dpy, EGLConfig config, const EGLint* attrib_list) {
@@ -633,7 +660,9 @@ extern "C"
     EGL_API EGLBoolean eglDestroySurface(EGLDisplay dpy, EGLSurface surface) {
         LOG_D("eglDestroySurface, dpy: %p, surface: %p", dpy, surface);
         LOAD_EGL(eglDestroySurface)
-        return egl_eglDestroySurface(dpy, surface);
+        const EGLBoolean result = egl_eglDestroySurface(dpy, surface);
+        mg_framediag::event("eglDestroySurface(%p) -> %s", surface, result == EGL_TRUE ? "ok" : "FAILED");
+        return result;
     }
 
     EGL_API EGLBoolean eglQuerySurface(EGLDisplay dpy, EGLSurface surface, EGLint attribute, EGLint* value) {
@@ -712,7 +741,9 @@ extern "C"
     EGL_API EGLBoolean eglSwapInterval(EGLDisplay dpy, EGLint interval) {
         LOG_D("eglSwapInterval, dpy: %p, interval: %d", dpy, interval);
         LOAD_EGL(eglSwapInterval)
-        return egl_eglSwapInterval(dpy, interval);
+        const EGLBoolean result = egl_eglSwapInterval(dpy, interval);
+        mg_framediag::event("eglSwapInterval(%d) -> %s", interval, result == EGL_TRUE ? "ok" : "FAILED");
+        return result;
     }
 
     EGL_API EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext share_context,
@@ -794,6 +825,7 @@ extern "C"
         const EGLBoolean result = egl_eglMakeCurrent(dpy, draw, read, ctx);
         ETRACE("eglMakeCurrent(dpy=%p, draw=%p, read=%p, ctx=%p, MGContext=%llu) -> %s", dpy, draw, read, ctx,
                before ? before->id : 0ULL, result == EGL_TRUE ? "ok" : "FAILED");
+        mg_framediag::event("eglMakeCurrent(draw=%p, ctx=%p) -> %s", draw, ctx, result == EGL_TRUE ? "ok" : "FAILED");
         // Only on success: a failed make-current leaves the previous context
         // current, so re-pointing the record would describe the wrong one.
         if (result == EGL_TRUE) mg_context_make_current(dpy, draw, read, ctx);
